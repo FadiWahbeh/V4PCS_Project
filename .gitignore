@@ -1,0 +1,54 @@
+# Build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+
+# Visual Studio
+.vs/
+*.vcxproj*
+*.sln
+*.user
+*.suo
+*.ipch
+*.pdb
+
+# Compiled object files and binaries
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.out
+
+# Coverage, reports, logs
+coverage/
+*.log
+
+# Editor directories and files
+.idea/
+*.swp
+*~
+
+# Qt Creator
+*.pro.user
+
+# Misc
+*.DS_Store
+
+# Ignore generated files
+**/CMakeFiles/
+**/cmake_install.cmake
+
+# Ignore temporary files
+*.tmp
+
+# Node/other irrelevant
+node_modules/
+
+# Do not ignore the 'libs/eigen' header-only dependency
+# (keep Eigen sources in the repo)
