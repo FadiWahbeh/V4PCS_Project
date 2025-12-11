@@ -5,7 +5,7 @@
 #include <iostream>
 #include <filesystem>
 #include <vector>
-
+#include <string>
 
 
 #include "fichier_manager.h"
@@ -18,7 +18,7 @@ int main() {
     auto res = input.lister_fichiers(".txt");
 
     for (const auto &temp : res) {
-        std::cout << "Fichier : " + std::string(temp) << std::endl;
+        std::cout << "Fichier : " << temp << std::endl;
         std::cout << "Construction de la grille de voxel" << std::endl;
         auto grille = grille_voxel(temp);
         double vs = grille.get_voxel_taille();
