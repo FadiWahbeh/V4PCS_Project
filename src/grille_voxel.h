@@ -8,7 +8,9 @@
 #include <functional>
 #include <filesystem>
 #include <iostream>
+#include <vector>
 #include <Eigen/Core>
+#include <unordered_map>
 
 
 struct voxel_clé
@@ -32,7 +34,6 @@ struct voxel_clé
             const std::size_t h2 = std::hash<int>{}(iy);
             const std::size_t h3 = std::hash<int>{}(iz);
 
-            // Combinaison des trois hachages pour former la clé finale
             return h1 ^ (h2 * 1315423911u) ^ (h3 * 2654435761u);
         }
     };
@@ -42,19 +43,23 @@ struct voxel_data
 {
     Eigen::Vector3d somme_position = Eigen::Vector3d::Zero();
     Eigen::Matrix3d somme_produit_externe = Eigen::Matrix3d::Zero();
+
+    Eigen::Vector3d somme_couleur = Eigen::Vector3d::Zero();
+
     std::uint64_t compteur = 0;
+
     Eigen::Vector3d barycentre = Eigen::Vector3d::Zero();
     Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
 
-    std::uint8_t r = 0;
-    std::uint8_t g = 0;
-    std::uint8_t b = 0;
+    std::uint8_t r = 200;
+    std::uint8_t g = 200;
+    std::uint8_t b = 200;
 
-    void add(const Eigen::Vector3d& s) noexcept
+    void add(const Eigen::Vector3d& s, const Eigen::Vector3d& c) noexcept
     {
         somme_position += s;
+        somme_couleur += c;
 
-        // s*s^T explicite pour limiter les temporaires
         const double x = s.x();
         const double y = s.y();
         const double z = s.z();
@@ -78,42 +83,37 @@ struct voxel_data
     void calculer_barycentre() noexcept
     {
         if (compteur != 0) {
-            barycentre = somme_position / static_cast<double>(compteur);
+            double div = static_cast<double>(compteur);
+            barycentre = somme_position / div;
+
+            Eigen::Vector3d moy_col = somme_couleur / div;
+
+            r = static_cast<std::uint8_t>(std::min(255.0, std::max(0.0, moy_col.x())));
+            g = static_cast<std::uint8_t>(std::min(255.0, std::max(0.0, moy_col.y())));
+            b = static_cast<std::uint8_t>(std::min(255.0, std::max(0.0, moy_col.z())));
         }
     }
 
-    void calculer_couleur(const voxel_clé &idx) {
+    void calculer_couleur_hash(const voxel_clé &idx) {
         constexpr voxel_clé::Hash hasher;
         const std::size_t h = hasher(idx);
-
         r = static_cast<std::uint8_t>(h & 0xFF);
         g = static_cast<std::uint8_t>((h >> 8) & 0xFF);
         b = static_cast<std::uint8_t>((h >> 16) & 0xFF);
-
-        // Ajustement pour éviter les couleurs trop sombres
-        if (r < 30 && g < 30 && b < 30) {
-            r = static_cast<std::uint8_t>(r + 50);
-            g = static_cast<std::uint8_t>(g + 50);
-            b = static_cast<std::uint8_t>(b + 50);
-        }
     }
 
     void calculer_covariance() noexcept
     {
-        // 1. Calculer le barycentre (déjà fait)
-
-        // 2. Calcul de la matrice de covariance C
-        // C = (1/N) * [ (somme(P * P^T)) - N * (barycentre * barycentre^T) ]
         const double N = static_cast<double>(compteur);
-
         const auto E_XXt = somme_produit_externe / N;
         const auto mu_muT = barycentre * barycentre.transpose();
-
-
-        // Covariance = E[X X^T] - E[X] E[X]^T
         covariance = E_XXt - mu_muT;
-
     }
+};
+
+struct PointRaw {
+    Eigen::Vector3d pos;
+    Eigen::Vector3d col;
 };
 
 class grille_voxel {
@@ -124,10 +124,6 @@ public:
                           double min_size = 0.03,
                           double max_size = 0.30);
 
-
-
-    //void exporter_en_ply(const std::filesystem::path& nom_fichier) const;
-
     double get_voxel_taille() const {
         return  m_voxel_taille;
     }
@@ -137,12 +133,21 @@ public:
         return m_grille;
     }
 
+    static inline bool is_comment_or_empty(const std::string& s) {
+        for (char c : s) {
+            if (!std::isspace(static_cast<unsigned char>(c))) {
+                return (c == '#' || c == '/' || c == ';');
+            }
+        }
+        return true;
+    }
 private:
     std::filesystem::path m_fichier;
     double m_voxel_taille = -1.0;
 
-    std::vector<Eigen::Vector3d> m_points; // nouveau
+    std::vector<PointRaw> m_points;
     std::unordered_map<voxel_clé, voxel_data, voxel_clé::Hash> m_grille;
+
 
     void charger_points();
     void estimer_voxel_size(double sommets_par_voxel, double min_size, double max_size);
@@ -150,8 +155,4 @@ private:
     voxel_clé calcule_clé(const Eigen::Vector3d &sommet) const noexcept;
 };
 
-
-
-
-
-#endif //GRILLE_VOXEL_H
+#endif

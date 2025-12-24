@@ -4,19 +4,18 @@
 
 #ifndef PATCH_BUILDER_H
 #define PATCH_BUILDER_H
+
 #include <vector>
-
 #include <Eigen/Core>
-
 #include "voxel_planaire_extraction.h"
 
 struct patch_planaire
 {
-    Eigen::Vector3d center;                    // centre du patch
-    Eigen::Vector3d normal;                    // normale moyenne
-    std::vector<const voxel_planaire*> voxels; // pointeurs vers les voxels planaires membres
+    Eigen::Vector3d center;
+    Eigen::Vector3d normal;
+    std::vector<const voxel_planaire*> voxels;
 
-    std::uint8_t r, g, b; // couleur pour visualisation
+    std::uint8_t r, g, b;
 };
 
 class patch_builder {
@@ -33,6 +32,9 @@ public:
 
     int get_patches_taille() const {return m_patches.size();}
 
+    const std::vector<patch_planaire>& get_patches() const {
+        return m_patches;
+    }
 
 private:
     double m_angle_thresh_cos;
@@ -48,4 +50,4 @@ private:
 
 
 
-#endif //PATCH_BUILDER_H
+#endif

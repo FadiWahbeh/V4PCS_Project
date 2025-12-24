@@ -1,16 +1,23 @@
 //
 // Created by Enzo Gallet on 09/12/2025.
+// Correction appliquée : Nommage des propriétés PLY (r->red) pour compatibilité CloudCompare.
 //
 
 #include "patch_builder.h"
 
 #include <vector>
-
 #include <fstream>
 #include <queue>
 #include <random>
-#include <set>
 #include <unordered_set>
+
+static void generer_couleur_aleatoire(std::uint8_t &r, std::uint8_t &g, std::uint8_t &b) {
+    static std::mt19937 rng(std::random_device{}());
+    static std::uniform_int_distribution<int> dist(50, 255); // Eviter les couleurs trop sombres
+    r = static_cast<std::uint8_t>(dist(rng));
+    g = static_cast<std::uint8_t>(dist(rng));
+    b = static_cast<std::uint8_t>(dist(rng));
+}
 
 void patch_builder::construire_patches(
     const std::unordered_map<voxel_clé, voxel_planaire, voxel_clé::Hash>& grille_planaire,
@@ -20,7 +27,6 @@ void patch_builder::construire_patches(
     if (grille_planaire.empty())
         return;
 
-    // 26-voisinage
     std::vector<Eigen::Vector3i> neighbors_offsets;
     neighbors_offsets.reserve(26);
     for (int dx = -1; dx <= 1; ++dx)
@@ -29,169 +35,111 @@ void patch_builder::construire_patches(
                 if (dx != 0 || dy != 0 || dz != 0)
                     neighbors_offsets.emplace_back(dx, dy, dz);
 
-    // Ensemble des clés déjà visitées
     std::unordered_set<voxel_clé, voxel_clé::Hash> visited;
     visited.reserve(grille_planaire.size());
 
-    // Générateur de couleurs
-    std::mt19937 rng(42);
-    std::uniform_int_distribution<int> color_dist(50, 255);
-
-    // Parcours de tous les voxels planaires
-    for (const auto& kv : grille_planaire)
+    for (const auto& [start_key, start_voxel] : grille_planaire)
     {
-        const voxel_clé& start_key = kv.first;
-
-        if (visited.find(start_key) != visited.end())
+        if (visited.contains(start_key))
             continue;
 
         patch_planaire patch;
-        patch.center.setZero();
-        patch.normal.setZero();
-        patch.voxels.clear();
-
-        patch.r = static_cast<std::uint8_t>(color_dist(rng));
-        patch.g = static_cast<std::uint8_t>(color_dist(rng));
-        patch.b = static_cast<std::uint8_t>(color_dist(rng));
-
-        Eigen::Vector3d sum_centers = Eigen::Vector3d::Zero();
-        Eigen::Vector3d sum_normals = Eigen::Vector3d::Zero();
-
-        std::queue<voxel_clé> q;
-        q.push(start_key);
+        generer_couleur_aleatoire(patch.r, patch.g, patch.b);
+        std::queue<voxel_clé> file;
+        file.push(start_key);
         visited.insert(start_key);
 
-        while (!q.empty())
+        Eigen::Vector3d sum_normals = Eigen::Vector3d::Zero();
+        Eigen::Vector3d sum_centers = Eigen::Vector3d::Zero();
+        Eigen::Vector3d ref_normal = start_voxel.normale;
+
+        while (!file.empty())
         {
-            voxel_clé current_key = q.front();
-            q.pop();
+            voxel_clé current_key = file.front();
+            file.pop();
 
-            auto it_current = grille_planaire.find(current_key);
-            if (it_current == grille_planaire.end())
-                continue; // ne devrait pas arriver, par sécurité
-
-            const voxel_planaire& current_voxel = it_current->second;
-
-            // Ajouter ce voxel au patch
+            const auto& current_voxel = grille_planaire.at(current_key);
             patch.voxels.push_back(&current_voxel);
 
-            // Accumulation du centre
+            Eigen::Vector3d cur_n = current_voxel.normale;
+            if (cur_n.dot(ref_normal) < 0) cur_n = -cur_n;
+
             sum_centers += current_voxel.barycentre;
+            sum_normals += cur_n;
 
-            // Accumulation de la normale en gérant l'orientation
-            if (sum_normals.isZero(1e-8))
+            for (const auto& offset : neighbors_offsets)
             {
-                sum_normals += current_voxel.normale;
-            }
-            else
-            {
-                if (current_voxel.normale.dot(sum_normals) < 0.0)
-                    sum_normals -= current_voxel.normale;
-                else
-                    sum_normals += current_voxel.normale;
-            }
-
-            // Exploration des voisins dans la grille
-            const Eigen::Vector3i& idx = current_key.index;
-            for (const auto& off : neighbors_offsets)
-            {
-                auto res = idx + off;
                 voxel_clé neighbor_key;
-                neighbor_key.index = idx + off;
+                neighbor_key.index = current_key.index + offset;
 
+                if (visited.contains(neighbor_key)) continue;
+                if (!grille_planaire.contains(neighbor_key)) continue;
 
-                if (visited.find(neighbor_key) != visited.end())
-                    continue;
-
-                auto it_neighbor = grille_planaire.find(neighbor_key);
-                if (it_neighbor == grille_planaire.end())
-                    continue; // ce voxel n'existe pas dans la grille planaire
-
-                const voxel_planaire& neighbor_voxel = it_neighbor->second;
+                const auto& neighbor_voxel = grille_planaire.at(neighbor_key);
 
                 if (est_connexion_lisse(current_voxel, neighbor_voxel))
                 {
                     visited.insert(neighbor_key);
-                    q.push(neighbor_key);
+                    file.push(neighbor_key);
                 }
             }
         }
 
         if (!patch.voxels.empty())
         {
-            const double n = static_cast<double>(patch.voxels.size());
+            double n = static_cast<double>(patch.voxels.size());
             patch.center = sum_centers / n;
-
-            if (!sum_normals.isZero(1e-8))
-                patch.normal = sum_normals.normalized();
-            else
-                patch.normal = patch.voxels.front()->normale;
-
+            patch.normal = sum_normals.normalized();
             m_patches.push_back(std::move(patch));
         }
     }
-
-
 }
 
+bool patch_builder::est_connexion_lisse(const voxel_planaire &a, const voxel_planaire &b) const {
+    double dot = std::abs(a.normale.dot(b.normale));
+    if (dot < m_angle_thresh_cos)
+        return false;
+
+    Eigen::Vector3d vec = b.barycentre - a.barycentre;
+    double dist = std::abs(a.normale.dot(vec));
+
+    if (dist > m_distance_thresh)
+        return false;
+
+    return true;
+}
 
 void patch_builder::exporter_patches_ply(const std::filesystem::path& nom_fichier) const
 {
-    // Construction des chemins de sortie
-    const std::filesystem::path centers_path =
-        std::filesystem::path(DATA_DIR_OUTPUT) /
-        (nom_fichier.filename().string() + ".patch_centers.ply");
-
-    const std::filesystem::path voxels_path =
-        std::filesystem::path(DATA_DIR_OUTPUT) /
-        (nom_fichier.filename().string() + ".patch_voxels.ply");
-
-    // ============================
-    // Export des centres
-    // ============================
-
     {
-        std::ofstream ofs(centers_path, std::ios::binary);
-        if (!ofs)
-            throw std::runtime_error("Impossible d'ouvrir le fichier : " + centers_path.string());
-
-        const std::size_t n_points = m_patches.size();
+        std::filesystem::path patches_path = nom_fichier.string() + ".patch_centers.ply";
+        std::ofstream ofs(patches_path);
+        if (!ofs) throw std::runtime_error("Erreur ouverture : " + patches_path.string());
 
         ofs << "ply\n"
                "format ascii 1.0\n"
-               "element vertex " << n_points << "\n"
+               "element vertex " << m_patches.size() << "\n"
                "property float x\n"
                "property float y\n"
                "property float z\n"
-               "property uchar r\n"
-               "property uchar g\n"
-               "property uchar b\n"
+               "property uchar red\n"
+               "property uchar green\n"
+               "property uchar blue\n"
                "end_header\n";
 
-        for (const patch_planaire& p : m_patches)
-        {
-            ofs << static_cast<float>(p.center.x()) << " "
-                << static_cast<float>(p.center.y()) << " "
-                << static_cast<float>(p.center.z()) << " "
-                << static_cast<int>(p.r) << " "
-                << static_cast<int>(p.g) << " "
-                << static_cast<int>(p.b) << "\n";
+        for (const auto& p : m_patches) {
+            ofs << p.center.x() << " " << p.center.y() << " " << p.center.z() << " "
+                << (int)p.r << " " << (int)p.g << " " << (int)p.b << "\n";
         }
     }
 
-    // ============================
-    // Export des voxels
-    // ============================
-
     {
-        // Comptage du nombre total de voxels
-        std::size_t n_voxels = 0;
-        for (const patch_planaire& p : m_patches)
-            n_voxels += p.voxels.size();
+        std::filesystem::path voxels_path = nom_fichier.string() + ".patch_voxels.ply";
+        std::ofstream ofs(voxels_path);
+        if (!ofs) throw std::runtime_error("Erreur ouverture : " + voxels_path.string());
 
-        std::ofstream ofs(voxels_path, std::ios::binary);
-        if (!ofs)
-            throw std::runtime_error("Impossible d'ouvrir le fichier : " + voxels_path.string());
+        std::size_t n_voxels = 0;
+        for (const auto& p : m_patches) n_voxels += p.voxels.size();
 
         ofs << "ply\n"
                "format ascii 1.0\n"
@@ -199,9 +147,9 @@ void patch_builder::exporter_patches_ply(const std::filesystem::path& nom_fichie
                "property float x\n"
                "property float y\n"
                "property float z\n"
-               "property uchar r\n"
-               "property uchar g\n"
-               "property uchar b\n"
+               "property uchar red\n"    // <--- CORRECTION: red au lieu de r
+               "property uchar green\n"  // <--- CORRECTION: green au lieu de g
+               "property uchar blue\n"   // <--- CORRECTION: blue au lieu de b
                "end_header\n";
 
         for (const patch_planaire& p : m_patches)
@@ -218,16 +166,3 @@ void patch_builder::exporter_patches_ply(const std::filesystem::path& nom_fichie
         }
     }
 }
-
-
-bool patch_builder::est_connexion_lisse(const voxel_planaire &a, const voxel_planaire &b) const {
-    const double dot = std::abs(a.normale.dot(b.normale));
-    if (dot < m_angle_thresh_cos) return false;
-
-    const double dist1 = std::abs(a.normale.dot(a.barycentre - b.barycentre));
-    const double dist2 = std::abs(b.normale.dot(b.barycentre - a.barycentre));
-
-    if (dist1 > m_distance_thresh || dist2 > m_distance_thresh) return false;
-    return true;
-}
-

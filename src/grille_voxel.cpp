@@ -3,9 +3,11 @@
 //
 
 #include "grille_voxel.h"
-
 #include <fstream>
 #include <iostream>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
 
 void grille_voxel::charger_points() {
     std::ifstream in(m_fichier);
@@ -14,15 +16,63 @@ void grille_voxel::charger_points() {
 
     m_points.clear();
 
+    std::string line;
+    std::size_t ok = 0;
+    std::size_t skipped = 0;
 
-    double x, y, z;
-    while (in >> x >> y >> z)
-    {
-        m_points.emplace_back(x, y, z);
+    while (std::getline(in, line)) {
+        if (line.empty() || is_comment_or_empty(line)) {
+            ++skipped;
+            continue;
+        }
+
+        std::replace(line.begin(), line.end(), ',', '.');
+
+        std::stringstream ss(line);
+        double val;
+        std::vector<double> values;
+        values.reserve(7);
+
+        while(ss >> val) {
+            values.push_back(val);
+        }
+
+        if (values.size() < 3) {
+            ++skipped;
+            continue;
+        }
+
+        double x = values[0];
+        double y = values[1];
+        double z = values[2];
+
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+            ++skipped;
+            continue;
+        }
+
+        Eigen::Vector3d color(200.0, 200.0, 200.0); // Gris par défaut
+
+        if (values.size() == 6) {
+            color = Eigen::Vector3d(values[3], values[4], values[5]);
+        }
+        else if (values.size() >= 7) {
+            color = Eigen::Vector3d(values[4], values[5], values[6]);
+        }
+        else if (values.size() == 9) {
+             color = Eigen::Vector3d(values[6], values[7], values[8]);
+        }
+
+        m_points.push_back({ Eigen::Vector3d(x, y, z), color });
+        ++ok;
     }
 
+    std::cout << "[charger_points] " << m_fichier.filename().string()
+              << " -> points OK=" << ok
+              << ", lignes ignorees=" << skipped << std::endl;
+
     if (m_points.empty())
-        throw std::runtime_error("Fichier vide : " + m_fichier.string());
+        throw std::runtime_error("Fichier vide ou illisible : " + m_fichier.string());
 }
 
 void grille_voxel::estimer_voxel_size(const double sommets_par_voxel,
@@ -40,9 +90,9 @@ void grille_voxel::estimer_voxel_size(const double sommets_par_voxel,
 
     for (const auto& p : m_points)
     {
-        const double x = p.x();
-        const double y = p.y();
-        const double z = p.z();
+        const double x = p.pos.x();
+        const double y = p.pos.y();
+        const double z = p.pos.z();
 
         if (x < min_x) min_x = x;
         if (y < min_y) min_y = y;
@@ -57,11 +107,9 @@ void grille_voxel::estimer_voxel_size(const double sommets_par_voxel,
     const double dz = max_z - min_z;
 
     double volume = dx * dy * dz;
-    if (volume <= 0.0)
-        volume = 1e-9;
+    if (volume <= 0.0) volume = 1e-9;
 
     const double densité = static_cast<double>(count) / volume;
-
     double voxel_volume = sommets_par_voxel / densité;
     double voxel_taille = std::cbrt(voxel_volume);
 
@@ -75,19 +123,19 @@ void grille_voxel::construire_grille()
 {
     m_grille.clear();
 
-    for (const auto& sommet : m_points)
+    for (const auto& pt : m_points)
     {
-        voxel_clé clé = calcule_clé(sommet);
+        voxel_clé clé = calcule_clé(pt.pos);
 
         auto [it, inserted] = m_grille.try_emplace(clé);
-        it->second.add(sommet);
+        // On passe maintenant la position ET la couleur
+        it->second.add(pt.pos, pt.col);
     }
 
     for (auto& [clé, data] : m_grille)
     {
-        data.calculer_barycentre();
+        data.calculer_barycentre(); // Calcule moyenne position ET couleur
         data.calculer_covariance();
-        data.calculer_couleur(clé);
     }
 }
 
@@ -111,7 +159,6 @@ grille_voxel::grille_voxel(const std::filesystem::path &fichier,
     construire_grille();
 }
 
-
 voxel_clé grille_voxel::calcule_clé(const Eigen::Vector3d &sommet) const noexcept
 {
     const double inv = 1.0 / m_voxel_taille;
@@ -123,4 +170,3 @@ voxel_clé grille_voxel::calcule_clé(const Eigen::Vector3d &sommet) const noexc
     clé.index = Eigen::Vector3i(ix, iy, iz);
     return clé;
 }
-

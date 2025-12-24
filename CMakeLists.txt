@@ -28,6 +28,10 @@ add_executable(V4PCS_Project
         src/voxel_planaire_extraction.h
         src/patch_builder.cpp
         src/patch_builder.h
+        src/patch_pair_generator.cpp
+        src/patch_pair_generator.h
+        src/v4pcs_algo.cpp
+        src/v4pcs_algo.h
 )
 
 
