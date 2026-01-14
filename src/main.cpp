@@ -1,348 +1,185 @@
-#include "IO/FileManager.h"
-#include "Geometry/VoxelGrid.h"
-#include "Geometry/PatchMerger.h"
-#include "Geometry/PlaneExtractor.h"
-
 #include <iostream>
 #include <filesystem>
 #include <vector>
-#include <cstdlib>
-#include <unordered_map>
-#include <limits>
+#include <string>
+#include <fstream>
 #include <algorithm>
-#include <cmath> 
+#include <chrono>
+#include <random>
+#include <Eigen/Core>
+
+#include "fichier_manager.h"
+#include "grille_voxel.h"
+#include "patch_builder.h"
+#include "voxel_planaire_extraction.h"
+#include "v4pcs_algo.h"
 
 namespace fs = std::filesystem;
 
-bool isSupportedExtension(const fs::path& p) {
-    std::string ext = p.extension().string();
-    for (auto& c : ext) c = static_cast<char>(std::tolower(c));
-    return (ext == ".ply" || ext == ".pcd" || ext == ".txt" || ext == ".xyz");
-}
+struct ColoredPoint {
+    Eigen::Vector3d p;
+    std::uint8_t r, g, b;
+};
 
-// Essaie de trouver un dossier data/source autour de l'exÈcutable
-bool findDataDirs(fs::path& sourceDir, fs::path& outputDir) {
-    fs::path exeDir = fs::current_path();
-
-    std::vector<fs::path> candidateRoots = {
-        exeDir,
-        exeDir / "..",
-        exeDir / ".." / "..",
-        exeDir / ".." / ".." / ".."
-    };
-
-    for (const auto& root : candidateRoots) {
-        fs::path s = root / "data" / "source";
-        fs::path o = root / "data" / "output";
-        if (fs::exists(s) && fs::is_directory(s)) {
-            if (!fs::exists(o)) {
-                fs::create_directories(o);
-            }
-            sourceDir = fs::canonical(s);
-            outputDir = fs::canonical(o);
-            return true;
-        }
+// Fonction pour √©crire un PLY simple
+static void write_ply_colored(const fs::path& path, const std::vector<ColoredPoint>& pts) {
+    std::ofstream ofs(path);
+    if (!ofs) {
+        std::cerr << "Erreur ecriture : " << path.string() << "\n";
+        return;
     }
-    return false;
+    ofs << "ply\nformat ascii 1.0\n"
+        << "element vertex " << pts.size() << "\n"
+        << "property float x\nproperty float y\nproperty float z\n"
+        << "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        << "end_header\n";
+    for (const auto& cp : pts) {
+        ofs << (float)cp.p.x() << " " << (float)cp.p.y() << " " << (float)cp.p.z() << " "
+            << (int)cp.r << " " << (int)cp.g << " " << (int)cp.b << "\n";
+    }
+    std::cout << " -> Fichier genere : " << path.filename() << "\n";
 }
 
-// Estimation automatique d'un voxel_size "raisonnable"
+static inline Eigen::Vector3d apply_T(const Eigen::Matrix4d& T, const Eigen::Vector3d& p) {
+    Eigen::Vector4d hp(p.x(), p.y(), p.z(), 1.0);
+    return (T * hp).head<3>();
+}
 
-double estimateOptimalVoxelSize(const V4PCS::PointCloud& cloud,
-    double targetPointsPerVoxel,
-    double minSize,
-    double maxSize)
+// Donn√©es interm√©diaires
+struct ResultatNuage {
+    std::string nom;
+    std::vector<patch_planaire> patchs;
+    std::vector<Eigen::Vector3d> planar_voxels;
+};
+
+static ResultatNuage traiter_nuage(const fs::path& chemin_fichier,
+                                  const fs::path& dossier_sortie,
+                                  const std::string& suffixe_debug)
 {
-    if (cloud.empty()) {
-        return 0.1;
+    ResultatNuage res;
+    res.nom = chemin_fichier.stem().string();
+    fs::path chemin_base = dossier_sortie / (res.nom + suffixe_debug);
+
+    std::cout << "\n--- Traitement : " << res.nom << " ---\n";
+
+    // 1. Voxelisation
+    double voxel_size = 0.20;
+    std::cout << " -> Voxelisation (grid=" << voxel_size << ")..." << std::flush;
+    grille_voxel grille(chemin_fichier, voxel_size);
+    std::cout << " OK (" << grille.get_grille().size() << " voxels)\n";
+
+    // 2. Extraction Planarit√©
+    std::cout << " -> Extraction Planarite..." << std::flush;
+    voxel_planaire_extraction extraction(0.4, 0.35);
+    extraction.extraire(grille);
+    const auto& g_plan = extraction.get_grille_planaire();
+    std::cout << " OK (" << g_plan.size() << " voxels plans)\n";
+
+    std::vector<ColoredPoint> debug_planar;
+    debug_planar.reserve(g_plan.size());
+    for (const auto& [k, v] : g_plan) {
+        res.planar_voxels.push_back(v.barycentre);
+        debug_planar.push_back({v.barycentre, 0, 255, 0});
     }
+    write_ply_colored(chemin_base.string() + ".planar_voxels.ply", debug_planar);
 
-    Eigen::Vector3d minPt = cloud[0].position;
-    Eigen::Vector3d maxPt = cloud[0].position;
+    // 3. Construction Patchs
+    std::cout << " -> Construction Patchs..." << std::flush;
+    patch_builder builder(15.0, voxel_size * 3.0);
+    builder.construire_patches(g_plan, grille.get_grille());
+    std::cout << " OK (" << builder.get_patches_taille() << " patchs)\n";
 
-    for (const auto& p : cloud) {
-        minPt = minPt.cwiseMin(p.position);
-        maxPt = maxPt.cwiseMax(p.position);
-    }
+    builder.exporter_patches_ply(chemin_base);
 
-    Eigen::Vector3d diag = maxPt - minPt;
-    double volume = std::max(1e-9,
-        diag.x() * diag.y() * diag.z());
+    // 4. Filtrage et S√©lection
+    std::vector<patch_planaire> tous = builder.get_patches();
+    std::vector<patch_planaire> valides;
+    valides.reserve(tous.size());
 
-    double density = static_cast<double>(cloud.size()) / volume;
-    double voxelVolume = targetPointsPerVoxel / density;
-    double voxelSize = std::cbrt(voxelVolume);
-    voxelSize = std::clamp(voxelSize, minSize, maxSize);
-
-    return voxelSize;
-}
-
-void processOneFile(const fs::path& inputPath,
-    const fs::path& outputDir,
-    double voxel_size) {
-
-    if (!fs::exists(inputPath)) {
-        std::cerr << " Fichier inexistant : " << inputPath << std::endl;
-        return;
-    }
-
-    if (!isSupportedExtension(inputPath)) {
-        std::cerr << "Extension non supportee : " << inputPath << std::endl;
-        return;
-    }
-
-    std::cout << "\n=============================\n";
-    std::cout << "Traitement de : " << inputPath << "\n";
-
-    // …tape 1 : Lecture
-
-    std::cout << "Etape 1 : Lecture (" << inputPath.extension().string() << ")\n";
-    V4PCS::PointCloud cloud = V4PCS::IO::FileManager::loadPointCloudAuto(inputPath.string());
-
-    if (cloud.empty()) {
-        std::cerr << "[ERREUR] Nuage vide ou illisible : " << inputPath << std::endl;
-        return;
-    }
-
-    std::cout << "Nombre de points lus : " << cloud.size() << "\n";
-
-    // Choix du voxel_size 
-
-    double voxel_size_local = voxel_size;
-
-    if (voxel_size_local <= 0.0) {
-        double targetPointsPerVoxel = 150.0;
-        double minSize = 0.03;
-        double maxSize = 0.30;
-
-        voxel_size_local = estimateOptimalVoxelSize(cloud,
-            targetPointsPerVoxel,
-            minSize,
-            maxSize);
-
-        std::cout << "[AUTO] voxel_size estime = " << voxel_size_local << " m\n";
-    }
-    else {
-        std::cout << "[MANUEL] voxel_size = " << voxel_size_local << " m\n";
-    }
-
-    std::string stem = inputPath.stem().string();
-    std::string vs_str = std::to_string(voxel_size_local);
-
-    fs::path outputVoxelPath = outputDir / ("voxelized_vs" + vs_str + "m_" + stem + ".ply");
-    fs::path outputPatchCentersPath = outputDir / ("patches_vs" + vs_str + "m_" + stem + ".ply");
-    fs::path outputPatchVoxelsPath = outputDir / ("patch_voxels_vs" + vs_str + "m_" + stem + ".ply");
-
-    // …tape 2 : Voxelisation
-
-    std::cout << "Etape 2 : Voxelisation (taille: " << voxel_size_local << " m)\n";
-    V4PCS::Geometry::VoxelGrid grid(voxel_size_local);
-    grid.build(cloud);
-
-    V4PCS::PointCloud voxel_centroids = grid.getVoxelCentroids();
-    std::cout << "voxel_centroids.size() = " << voxel_centroids.size() << "\n";
-    std::cout << "Nombre de voxels crees : " << voxel_centroids.size() << "\n";
-    std::cout << "Ratio de reduction : "
-        << (1.0 - (double)voxel_centroids.size() / cloud.size()) * 100.0
-        << " %\n";
-
-    std::cout << "--- Etape 3 : Sauvegarde des voxels ---\n";
-    V4PCS::IO::FileManager::savePLY(outputVoxelPath.string(), voxel_centroids);
-    std::cout << "[OK] Voxelisation : " << outputVoxelPath << "\n";
-
-    // …tape 4 : Extraction de plans par voxel
-
-    std::cout << "Etape 4 : Extraction des plans par voxel\n";
-
-    std::vector<V4PCS::Voxel> voxels = grid.getVoxelsAsVector();
-
-    double linearity_thresh = 0.8;
-    double curvature_thresh = 0.1;
-
-    V4PCS::PlaneExtractor extractor(voxel_size_local, linearity_thresh, curvature_thresh);
-    std::vector<V4PCS::Plane> planes = extractor.extractPlanes(voxels);
-
-    std::cout << "Nombre de voxels planaires (plans extraits) : "
-        << planes.size() << "\n";
-
-    if (planes.empty()) {
-        std::cout << "[INFO] Aucun plan extrait, on s'arrÍte ici pour ce fichier.\n";
-        return;
-    }
-
-    // …tape 5 : Construction du grid_map
-
-    std::cout << "Etape 5 : Construction du grid_map pour les plans\n";
-
-    std::unordered_map<Eigen::Vector3i, int, V4PCS::Vector3iHash> grid_map;
-    grid_map.reserve(planes.size());
-
-    for (int i = 0; i < static_cast<int>(planes.size()); ++i) {
-        grid_map[planes[i].grid_index] = i;
-    }
-
-    // …tape 6 : Fusion des plans en patches
-
-    std::cout << "Etape 6 : Fusion des plans en patches\n";
-
-    double angle_thresh_deg = 10.0;
-    double distance_thresh = voxel_size_local * 1.5;
-
-    V4PCS::Geometry::PatchMerger merger(angle_thresh_deg, distance_thresh);
-    std::vector<V4PCS::PlanarPatch> patches = merger.merge(planes, grid_map);
-
-    std::cout << "Nombre de patches obtenus : " << patches.size() << "\n";
-
-    if (patches.empty()) {
-        std::cout << "[INFO] Aucun patch fusionnÈ, pas de PLY patches.\n";
-        return;
-    }
-
-    // Debug : stats sur la taille des patches
-
-    {
-        size_t min_sz = std::numeric_limits<size_t>::max();
-        size_t max_sz = 0;
-        size_t sum_sz = 0;
-
-        for (const auto& patch : patches) {
-            size_t s = patch.component_planes.size();
-            min_sz = std::min(min_sz, s);
-            max_sz = std::max(max_sz, s);
-            sum_sz += s;
-        }
-
-        double mean_sz = patches.empty()
-            ? 0.0
-            : static_cast<double>(sum_sz) / patches.size();
-
-        std::cout << "Patch size (nb de voxels-plan par patch) : "
-            << "min=" << min_sz
-            << ", max=" << max_sz
-            << ", mean=" << mean_sz << "\n";
-    }
-
-    // …tape 7 : Nuage de centres de patches
-
-    std::cout << "Etape 7 : Construction du nuage de centres de patches\n";
-
-    V4PCS::PointCloud patchCentersCloud;
-    patchCentersCloud.reserve(patches.size());
-
-    for (const auto& patch : patches) {
-        V4PCS::Point p;
-        p.position = patch.center;
-        p.r = patch.r;
-        p.g = patch.g;
-        p.b = patch.b;
-        patchCentersCloud.push_back(p);
-    }
-
-    // …tape 7 bis : Nuage de voxels planaires colorÈs par patch
-
-    std::cout << "Etape 7 bis : Construction du nuage de voxels colorÈs par patch\n";
-
-    V4PCS::PointCloud patchVoxelsCloud;
-    patchVoxelsCloud.reserve(planes.size());
-
-    for (const auto& patch : patches) {
-        for (const auto* planePtr : patch.component_planes) {
-            if (!planePtr) continue;
-
-            V4PCS::Point p;
-            p.position = planePtr->centroid;
-            p.r = patch.r;
-            p.g = patch.g;
-            p.b = patch.b;
-            patchVoxelsCloud.push_back(p);
+    // suppression du bruit
+    for(const auto& p : tous) {
+        if(p.voxel_keys.size() >= 5) {
+            valides.push_back(p);
         }
     }
 
-    // …tape 8 : Sauvegardes
+    std::cout << " -> Melange aleatoire de " << valides.size() << " patchs..." << std::endl;
+    std::shuffle(valides.begin(), valides.end(), std::mt19937(std::random_device{}()));
 
-    std::cout << "--- Etape 8 : Sauvegarde des patches (centres) ---\n";
-    V4PCS::IO::FileManager::savePLY(outputPatchCentersPath.string(), patchCentersCloud);
-    std::cout << "[OK] Patches (centres) sauvegardes : " << outputPatchCentersPath << "\n";
+    // On garde 1200 patchs pour donner un maximum de chances √† l'algo
+    int max_p = 1200;
+    for (const auto& p : valides) {
+        res.patchs.push_back(p);
+        if (res.patchs.size() >= static_cast<size_t>(max_p)) break;
+    }
+    std::cout << " -> Patchs Conserves pour l'algo : " << res.patchs.size() << "\n";
 
-    std::cout << "--- Etape 9 : Sauvegarde des voxels colorÈs par patch ---\n";
-    V4PCS::IO::FileManager::savePLY(outputPatchVoxelsPath.string(), patchVoxelsCloud);
-    std::cout << "[OK] Voxels par patch sauvegardes : " << outputPatchVoxelsPath << "\n";
+    return res;
 }
 
-int main(int argc, char** argv) {
+int main()
+{
+    std::cout << "=== V4PCS PROJECT : RECALAGE REEL (FULL DEBUG) ===\n";
 
-    fs::path sourceDir, outputDir;
-    if (!findDataDirs(sourceDir, outputDir)) {
-        std::cerr << "[ERREUR] Impossible de trouver un dossier data/source.\n";
-        std::cerr << "Je cherche autour de : " << fs::current_path() << "\n";
-        std::cerr << "Assure-toi d'avoir une arborescence du type :\n"
-            << "  <racine_projet>/data/source\n"
-            << "  <racine_projet>/data/output\n";
+    const std::string INPUT_DIR = "../data/input";
+    const std::string OUTPUT_DIR = "../data/output";
+
+    if (!fs::exists(INPUT_DIR)) {
+        fs::create_directories(INPUT_DIR);
+        std::cerr << "Dossier input cree. Ajoutez vos fichiers.\n";
+        return -1;
+    }
+    if (!fs::exists(OUTPUT_DIR)) fs::create_directories(OUTPUT_DIR);
+
+    fichier_manager manager(INPUT_DIR);
+    auto fichiers = manager.lister_fichiers("");
+
+    if (fichiers.size() < 2) {
+        std::cerr << "Erreur: Il faut 2 fichiers dans input.\n";
         return -1;
     }
 
-    std::cout << "RÈpertoire de travail  : " << fs::current_path() << "\n";
-    std::cout << "Dossier source choisi  : " << sourceDir << "\n";
-    std::cout << "Dossier output choisi  : " << outputDir << "\n";
+    std::sort(fichiers.begin(), fichiers.end());
 
-    // 1. Lecture du voxel_size
+    fs::path path_target = fichiers[0]; // Station 1 (Fixe)
+    fs::path path_source = fichiers[1]; // Station 3 (Mobile)
 
-    double voxel_size = -1.0;
+    std::cout << " TARGET (Fixe)   : " << path_target.filename() << "\n";
+    std::cout << " SOURCE (Mobile) : " << path_source.filename() << "\n";
 
-    int firstFileArg = 1;
-    if (argc >= 2) {
+    ResultatNuage data_tgt = traiter_nuage(path_target, OUTPUT_DIR, "_TARGET");
+    ResultatNuage data_src = traiter_nuage(path_source, OUTPUT_DIR, "_SOURCE");
 
-        char* endPtr = nullptr;
-        double vs_candidate = std::strtod(argv[1], &endPtr);
+    if (data_src.patchs.empty() || data_tgt.patchs.empty()) return -1;
 
-        if (endPtr != argv[1] && *endPtr == '\0') {
-            voxel_size = vs_candidate;
-            firstFileArg = 2;
-        }
-        else {
-            firstFileArg = 1;
-        }
-    }
+    std::cout << "\n--- Lancement V4PCS ---\n";
 
-    if (voxel_size <= 0.0) {
-        std::cout << "voxel_size = AUTO (sera estime par fichier)\n";
-    }
-    else {
-        std::cout << "voxel_size fixe (manuel) = " << voxel_size << " m\n";
-    }
+    // Distance 1.0m : Large tol√©rance car peu de recouvrement
+    // Angle 45.0 deg : Tr√®s permissif pour les normales
+    v4pcs_algo algo(1.0, 45.0);
 
-    // 2) Traitement des fichiers
+    auto t1 = std::chrono::high_resolution_clock::now();
 
-    // CAS A : des fichiers sont passÈs en argument
-    if (argc > firstFileArg) {
-        for (int i = firstFileArg; i < argc; ++i) {
-            fs::path p(argv[i]);
+    // 30000 essais ou 300 secondes (5 minutes) pour trouver la bonne combinaison
+    Eigen::Matrix4d T = algo.aligner(data_src.patchs, data_tgt.patchs, 30000, 300);
 
-            if (p.is_relative()) {
-                p = sourceDir / p;
-            }
+    auto t2 = std::chrono::high_resolution_clock::now();
 
-            processOneFile(p, outputDir, voxel_size);
-        }
-    }
-    // CAS B : aucun fichier, on traite tout ce qu'il y a dans sourceDir
-    else {
-        bool anyFile = false;
-        for (const auto& entry : fs::directory_iterator(sourceDir)) {
-            if (!entry.is_regular_file()) continue;
-            const fs::path& p = entry.path();
-            if (!isSupportedExtension(p)) continue;
+    std::cout << "\nTemps V4PCS : " << std::chrono::duration<double>(t2-t1).count() << "s\n";
+    std::cout << "Transformation Finale :\n" << T << "\n";
 
-            anyFile = true;
-            processOneFile(p, outputDir, voxel_size);
-        }
+    std::cout << "Generation du fichier ALIGNEMENT...\n";
+    std::vector<ColoredPoint> visual;
 
-        if (!anyFile) {
-            std::cerr << "[INFO] Aucun fichier .ply/.pcd/.txt/.xyz trouve dans "
-                << sourceDir << "\n";
-        }
-    }
+    // Cible en ROUGE
+    for(const auto& p : data_tgt.planar_voxels) visual.push_back({p, 255, 0, 0});
 
-    std::cout << "\n=== Termine ===\n";
+    // Source recal√©e en CYAN (Bleu-Vert)
+    for(const auto& p : data_src.planar_voxels) visual.push_back({apply_T(T, p), 0, 255, 255});
+
+    fs::path out_path = fs::path(OUTPUT_DIR) / ("ALIGNEMENT_" + data_src.nom + "_SUR_" + data_tgt.nom + ".ply");
+    write_ply_colored(out_path, visual);
+
+    std::cout << "Termine. Verifiez le dossier output.\n";
     return 0;
 }
